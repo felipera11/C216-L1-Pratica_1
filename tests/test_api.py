@@ -168,3 +168,42 @@ class TestRemocao:
 
         r_lista = requests.get(f"{BASE_URL}/api/v1/alunos/")
         assert r_lista.json()["total"] == 0
+
+
+# ── Testes de Persistência ────────────────────────────────────────────────────
+
+class TestPersistencia:
+
+    def test_dados_persistem_apos_multiplas_consultas(self):
+        cadastrar("Ana Lima", "ana@email.com", "GES")
+        cadastrar("Bruno Silva", "bruno@email.com", "GEC")
+
+        r1 = requests.get(f"{BASE_URL}/api/v1/alunos/")
+        r2 = requests.get(f"{BASE_URL}/api/v1/alunos/")
+
+        assert r1.json()["total"] == 2
+        assert r2.json()["total"] == 2
+        assert r1.json()["alunos"] == r2.json()["alunos"]
+
+    def test_dado_persiste_apos_atualizacao(self):
+        cadastrar("Ana Lima", "ana@email.com", "GES")
+        requests.patch(f"{BASE_URL}/api/v1/alunos/GES1", json={"nome": "Ana Souza"})
+
+        r = requests.get(f"{BASE_URL}/api/v1/alunos/GES1")
+        assert r.status_code == 200
+        assert r.json()["nome"] == "Ana Souza"
+
+    def test_dado_persiste_apos_remocao_parcial(self):
+        cadastrar("Ana Lima", "ana@email.com", "GES")
+        cadastrar("Bruno Silva", "bruno@email.com", "GES")
+        cadastrar("Carlos Souza", "carlos@email.com", "GES")
+
+        requests.delete(f"{BASE_URL}/api/v1/alunos/GES2")
+
+        r = requests.get(f"{BASE_URL}/api/v1/alunos/")
+        assert r.json()["total"] == 2
+
+        ids = [a["id"] for a in r.json()["alunos"]]
+        assert "GES1" in ids
+        assert "GES3" in ids
+        assert "GES2" not in ids

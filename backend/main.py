@@ -1,152 +1,233 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-from data import students, AVAILABLE_COURSES
-from utils import generate_enrollment_id, validate_email
+import psycopg2
+import psycopg2.extras
+import os
+from utils import validate_email, generate_enrollment_id
 
-app = FastAPI(title="Sistema de Gerenciamento de Alunos")
+app = FastAPI(title="Gerenciador de Alunos")
+
+AVAILABLE_COURSES = {
+    "GES": "Engenharia de Software",
+    "GEC": "Engenharia da Computação",
+    "GET": "Engenharia de Telecomunicações",
+    "GEP": "Engenharia de Produção",
+    "GEA": "Engenharia de Automação",
+    "GEL": "Engenharia Elétrica",
+    "GEB": "Engenharia Biomédica",
+}
 
 
-# ── Schemas ──────────────────────────────────────────────────────────────────
+# ── Conexão com o banco ───────────────────────────────────────────────────────
 
-class StudentCreate(BaseModel):
-    name: str
+def get_conn():
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST", "db"),
+        database=os.getenv("DB_NAME", "alunos_db"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASSWORD", "postgres"),
+    )
+
+
+# ── Inicialização das tabelas ─────────────────────────────────────────────────
+
+@app.on_event("startup")
+def startup():
+    import time
+    for _ in range(10):
+        try:
+            conn = get_conn()
+            break
+        except Exception:
+            time.sleep(2)
+
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS alunos (
+            id VARCHAR(20) PRIMARY KEY,
+            nome VARCHAR(100) NOT NULL,
+            email VARCHAR(100) UNIQUE NOT NULL,
+            curso VARCHAR(10) NOT NULL,
+            curso_nome VARCHAR(100) NOT NULL
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS enrollment_counters (
+            curso VARCHAR(10) PRIMARY KEY,
+            contador INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# ── Schemas ───────────────────────────────────────────────────────────────────
+
+class AlunoCreate(BaseModel):
+    nome: str
     email: str
-    course_code: str  # ex: "1" a "7"
+    curso: str
 
-class StudentUpdate(BaseModel):
-    name: Optional[str] = None
+class AlunoUpdate(BaseModel):
+    nome: Optional[str] = None
     email: Optional[str] = None
-    course_code: Optional[str] = None
+    curso: Optional[str] = None
 
 
-# ── Helper ───────────────────────────────────────────────────────────────────
+# ── Helper ────────────────────────────────────────────────────────────────────
 
-def validate_student_input(name: str | None, email: str | None, course_code: str | None, current_enrollment: str | None = None):
-    if name is not None and len(name) < 3:
+def validate_input(nome=None, email=None, curso=None, current_id=None):
+    if nome is not None and len(nome.strip()) < 3:
         raise HTTPException(status_code=400, detail="Nome deve ter pelo menos 3 caracteres.")
 
     if email is not None:
         if not validate_email(email):
             raise HTTPException(status_code=400, detail="E-mail inválido.")
-        existing_emails = [
-            s["email"] for eid, s in students.items() if eid != current_enrollment
-        ]
-        if email in existing_emails:
+        conn = get_conn()
+        cur = conn.cursor()
+        if current_id:
+            cur.execute("SELECT id FROM alunos WHERE email = %s AND id != %s", (email.lower(), current_id))
+        else:
+            cur.execute("SELECT id FROM alunos WHERE email = %s", (email.lower(),))
+        existing = cur.fetchone()
+        cur.close()
+        conn.close()
+        if existing:
             raise HTTPException(status_code=400, detail="Já existe um aluno com esse e-mail.")
 
-    if course_code is not None and course_code not in AVAILABLE_COURSES:
+    if curso is not None and curso.upper() not in AVAILABLE_COURSES:
         raise HTTPException(
             status_code=400,
             detail=f"Curso inválido. Opções: {list(AVAILABLE_COURSES.keys())}"
         )
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"message": "API de Gerenciamento de Alunos 🎓"}
+    return {"message": "Gerenciador de Alunos 🎓"}
+
+
+# POST - cadastrar novo aluno
+@app.post("/api/v1/alunos/", status_code=201)
+def cadastrar_aluno(aluno: AlunoCreate):
+    validate_input(aluno.nome, aluno.email, aluno.curso)
+
+    curso = aluno.curso.upper()
+    curso_nome = AVAILABLE_COURSES[curso]
+
+    conn = get_conn()
+    cur = conn.cursor()
+    aluno_id = generate_enrollment_id(curso, cur)
+
+    cur.execute(
+        "INSERT INTO alunos (id, nome, email, curso, curso_nome) VALUES (%s, %s, %s, %s, %s)",
+        (aluno_id, aluno.nome.strip(), aluno.email.strip().lower(), curso, curso_nome)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"message": "Aluno cadastrado com sucesso!", "aluno": {
+        "id": aluno_id,
+        "nome": aluno.nome.strip(),
+        "email": aluno.email.strip().lower(),
+        "curso": curso,
+        "curso_nome": curso_nome,
+    }}
 
 
 # GET - listar todos os alunos
-@app.get("/api/v1/students")
-def list_students():
-    return {"total": len(students), "students": list(students.values())}
+@app.get("/api/v1/alunos/")
+def listar_alunos():
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM alunos ORDER BY id")
+    alunos = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {"total": len(alunos), "alunos": alunos}
 
 
-# GET - buscar aluno por matrícula (path parameter)
-@app.get("/api/v1/students/{enrollment_id}")
-def get_student(enrollment_id: str):
-    enrollment_id = enrollment_id.upper()
-    if enrollment_id not in students:
-        raise HTTPException(status_code=404, detail=f"Matrícula '{enrollment_id}' não encontrada.")
-    return students[enrollment_id]
+# DELETE - resetar lista de alunos (deve vir ANTES do /{aluno_id})
+@app.delete("/api/v1/alunos/")
+def resetar_alunos():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM alunos")
+    cur.execute("DELETE FROM enrollment_counters")
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Lista de alunos resetada com sucesso."}
 
 
-# GET - buscar aluno por e-mail (query parameter)
-@app.get("/api/v1/students/search/by-email")
-def get_student_by_email(email: str):
-    for student in students.values():
-        if student["email"] == email.lower():
-            return student
-    raise HTTPException(status_code=404, detail="Nenhum aluno encontrado com esse e-mail.")
+# GET - buscar aluno por ID
+@app.get("/api/v1/alunos/{aluno_id}")
+def buscar_aluno(aluno_id: str):
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM alunos WHERE id = %s", (aluno_id.upper(),))
+    aluno = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not aluno:
+        raise HTTPException(status_code=404, detail=f"Aluno '{aluno_id}' não encontrado.")
+    return aluno
 
 
-# GET - listar cursos disponíveis
-@app.get("/api/v1/courses")
-def list_courses():
-    return {
-        code: {"abbreviation": abbr, "name": name}
-        for code, (abbr, name) in AVAILABLE_COURSES.items()
-    }
+# PATCH - atualizar dados de um aluno parcialmente
+@app.patch("/api/v1/alunos/{aluno_id}")
+def atualizar_aluno(aluno_id: str, aluno: AlunoUpdate):
+    aluno_id = aluno_id.upper()
+
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM alunos WHERE id = %s", (aluno_id,))
+    existing = cur.fetchone()
+    if not existing:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Aluno '{aluno_id}' não encontrado.")
+
+    validate_input(aluno.nome, aluno.email, aluno.curso, current_id=aluno_id)
+
+    if aluno.nome:
+        cur.execute("UPDATE alunos SET nome = %s WHERE id = %s", (aluno.nome.strip(), aluno_id))
+    if aluno.email:
+        cur.execute("UPDATE alunos SET email = %s WHERE id = %s", (aluno.email.strip().lower(), aluno_id))
+    if aluno.curso:
+        curso = aluno.curso.upper()
+        cur.execute("UPDATE alunos SET curso = %s, curso_nome = %s WHERE id = %s",
+                    (curso, AVAILABLE_COURSES[curso], aluno_id))
+    conn.commit()
+
+    cur.execute("SELECT * FROM alunos WHERE id = %s", (aluno_id,))
+    atualizado = cur.fetchone()
+    cur.close()
+    conn.close()
+    return {"message": "Aluno atualizado com sucesso!", "aluno": atualizado}
 
 
-# POST - criar aluno
-@app.post("/api/v1/students", status_code=201)
-def create_student(student: StudentCreate):
-    validate_student_input(student.name, student.email, student.course_code)
+# DELETE - remover aluno por ID
+@app.delete("/api/v1/alunos/{aluno_id}")
+def remover_aluno(aluno_id: str):
+    aluno_id = aluno_id.upper()
 
-    abbr, course_name = AVAILABLE_COURSES[student.course_code]
-    enrollment_id = generate_enrollment_id(abbr)
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM alunos WHERE id = %s", (aluno_id,))
+    aluno = cur.fetchone()
+    if not aluno:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Aluno '{aluno_id}' não encontrado.")
 
-    new_student = {
-        "enrollment_id": enrollment_id,
-        "name": student.name.strip(),
-        "email": student.email.strip().lower(),
-        "course_code": abbr,
-        "course_name": course_name,
-    }
-    students[enrollment_id] = new_student
-    return {"message": "Aluno cadastrado com sucesso!", "student": new_student}
-
-
-# PUT - atualizar aluno completo
-@app.put("/api/v1/students/{enrollment_id}")
-def update_student(enrollment_id: str, student: StudentCreate):
-    enrollment_id = enrollment_id.upper()
-    if enrollment_id not in students:
-        raise HTTPException(status_code=404, detail=f"Matrícula '{enrollment_id}' não encontrada.")
-
-    validate_student_input(student.name, student.email, student.course_code, enrollment_id)
-
-    abbr, course_name = AVAILABLE_COURSES[student.course_code]
-    students[enrollment_id].update({
-        "name": student.name.strip(),
-        "email": student.email.strip().lower(),
-        "course_code": abbr,
-        "course_name": course_name,
-    })
-    return {"message": "Aluno atualizado com sucesso!", "student": students[enrollment_id]}
-
-
-# PATCH - atualizar aluno parcialmente
-@app.patch("/api/v1/students/{enrollment_id}")
-def patch_student(enrollment_id: str, student: StudentUpdate):
-    enrollment_id = enrollment_id.upper()
-    if enrollment_id not in students:
-        raise HTTPException(status_code=404, detail=f"Matrícula '{enrollment_id}' não encontrada.")
-
-    validate_student_input(student.name, student.email, student.course_code, enrollment_id)
-
-    if student.name:
-        students[enrollment_id]["name"] = student.name.strip()
-    if student.email:
-        students[enrollment_id]["email"] = student.email.strip().lower()
-    if student.course_code:
-        abbr, course_name = AVAILABLE_COURSES[student.course_code]
-        students[enrollment_id]["course_code"] = abbr
-        students[enrollment_id]["course_name"] = course_name
-
-    return {"message": "Aluno atualizado parcialmente!", "student": students[enrollment_id]}
-
-
-# DELETE - remover aluno
-@app.delete("/api/v1/students/{enrollment_id}")
-def delete_student(enrollment_id: str):
-    enrollment_id = enrollment_id.upper()
-    if enrollment_id not in students:
-        raise HTTPException(status_code=404, detail=f"Matrícula '{enrollment_id}' não encontrada.")
-
-    removed = students.pop(enrollment_id)
-    return {"message": f"Aluno '{removed['name']}' removido com sucesso."}
+    cur.execute("DELETE FROM alunos WHERE id = %s", (aluno_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": f"Aluno '{aluno['nome']}' removido com sucesso."}
